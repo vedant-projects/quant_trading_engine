@@ -1,0 +1,174 @@
+name: personal-quant-engine
+
+x-app-environment: &app-environment
+  APP_ENV: development
+  IS_PAPER: "true"
+  ENABLE_LIVE_TRADING: "false"
+
+  DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-quant}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-quant_engine}"
+  REDIS_URL: "redis://redis:6379/0"
+
+  DATA_DIRECTORY: /opt/quant-engine/data
+  REPORT_DIRECTORY: /opt/quant-engine/reports
+
+  MAX_DAILY_LOSS_PCT: "${MAX_DAILY_LOSS_PCT:-2.0}"
+  MAX_POSITION_PCT: "${MAX_POSITION_PCT:-10.0}"
+  LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+
+x-local-logging: &local-logging
+  driver: local
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-application: &application
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+  environment: *app-environment
+  logging: *local-logging
+  networks:
+    - quant_network
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg17-oss
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-quant}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}"
+      POSTGRES_DB: "${POSTGRES_DB:-quant_engine}"
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"'
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    logging: *local-logging
+    networks:
+      - quant_network
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *local-logging
+    networks:
+      - quant_network
+
+  api:
+    <<: *application
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).close()"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    <<: *application
+    restart: unless-stopped
+    command:
+      - python
+      - -m
+      - celery
+      - -A
+      - app.tasks.celery_app:celery_app
+      - worker
+      - --loglevel=INFO
+      - --concurrency=1
+    volumes:
+      - ../data:/opt/quant-engine/data:ro
+      - ../reports:/opt/quant-engine/reports
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  beat:
+    <<: *application
+    restart: unless-stopped
+    command:
+      - python
+      - -m
+      - celery
+      - -A
+      - app.tasks.celery_app:celery_app
+      - beat
+      - --loglevel=INFO
+      - --schedule=/tmp/quant-celerybeat
+    volumes:
+      - ../data:/opt/quant-engine/data:ro
+      - ../reports:/opt/quant-engine/reports:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  dashboard:
+    <<: *application
+    restart: unless-stopped
+    environment:
+      <<: *app-environment
+      API_BASE_URL: http://api:8000
+    command:
+      - python
+      - -m
+      - streamlit
+      - run
+      - dashboard/main.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+      - --browser.gatherUsageStats=false
+    ports:
+      - "127.0.0.1:8501:8501"
+    volumes:
+      - ../reports:/opt/quant-engine/reports:ro
+    depends_on:
+      api:
+        condition: service_started
+
+  migrate:
+    <<: *application
+    profiles:
+      - tools
+    restart: "no"
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  timescale_data:
+  redis_data:
+
+networks:
+  quant_network:
+    driver: bridge
